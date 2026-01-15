@@ -31,6 +31,7 @@ class RunConfig:
     # Model
     dim: int = 128
     n_layers: int = 2
+    # This must be >= seq_len. The MIRAS paper uses 4096.
     max_seq_len: int = 256
 
     # Training
@@ -99,6 +100,9 @@ def _load_or_build_token_buffer(
     meta_path = run_dir / "token_buffer_meta.json"
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+    # We're not using a HF "model" here; we just tokenize text into ids.
+    # Some tokenizers (e.g. GPT-2) default to model_max_length=1024 and warn on longer texts.
+    tokenizer.model_max_length = 10**9
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -150,7 +154,7 @@ def _load_or_build_token_buffer(
             "dataset_split": cfg.dataset_split,
             "tokenizer_name": cfg.tokenizer_name,
             "buffer_tokens": int(flat.numel()),
-            "created_utc": dt.datetime.utcnow().isoformat() + "Z",
+            "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "build_seconds": time.time() - started,
         },
     )
@@ -207,7 +211,7 @@ def _checkpoint(
             "torch": torch.get_rng_state(),
             "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         },
-        "saved_utc": dt.datetime.utcnow().isoformat() + "Z",
+        "saved_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     torch.save(payload, path)
 
@@ -247,11 +251,29 @@ def main() -> None:
     parser.add_argument("--run-name", type=str, default=None, help="Run folder name under runs/.")
     parser.add_argument("--resume", type=str, default=None, help="Path to a checkpoint .pt file.")
     parser.add_argument("--max-time-seconds", type=int, default=None)
+    parser.add_argument("--seq-len", type=int, default=None, help="Training context length (paper: 4096).")
+    parser.add_argument("--max-seq-len", type=int, default=None, help="RoPE/cache precompute length (must be >= seq-len).")
+    parser.add_argument("--microbatch-size", type=int, default=None)
+    parser.add_argument("--grad-accum-steps", type=int, default=None)
+    parser.add_argument("--buffer-tokens", type=int, default=None, help="How many tokens to cache locally.")
     args = parser.parse_args()
 
     cfg = RunConfig(run_name=args.run_name)
     if args.max_time_seconds is not None:
         cfg = dataclasses.replace(cfg, max_time_seconds=int(args.max_time_seconds))
+    if args.seq_len is not None:
+        cfg = dataclasses.replace(cfg, seq_len=int(args.seq_len))
+    if args.max_seq_len is not None:
+        cfg = dataclasses.replace(cfg, max_seq_len=int(args.max_seq_len))
+    if args.microbatch_size is not None:
+        cfg = dataclasses.replace(cfg, microbatch_size=int(args.microbatch_size))
+    if args.grad_accum_steps is not None:
+        cfg = dataclasses.replace(cfg, grad_accum_steps=int(args.grad_accum_steps))
+    if args.buffer_tokens is not None:
+        cfg = dataclasses.replace(cfg, buffer_tokens=int(args.buffer_tokens))
+
+    if cfg.max_seq_len < cfg.seq_len:
+        raise ValueError(f"max_seq_len must be >= seq_len, got {cfg.max_seq_len} < {cfg.seq_len}")
 
     device = _select_device(cfg.device)
     _seed_all(cfg.seed)
@@ -335,7 +357,7 @@ def main() -> None:
                 "device": str(device),
                 "grad_norm": float(grad_norm.detach().cpu()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
                 "lr": optimizer.param_groups[0]["lr"],
-                "timestamp_utc": dt.datetime.utcnow().isoformat() + "Z",
+                "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             }
             with metrics_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
