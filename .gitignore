@@ -201,6 +201,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Local training runs / checkpoints
+runs/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
