@@ -17,13 +17,49 @@ class RMSNorm(nn.Module):
 class SwiGLUMLP(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        # Fused SwiGLU input projection: one GEMM instead of two.
+        # Equivalent to separate w1/w3 with:
+        #   w13.weight = cat([w1.weight, w3.weight], dim=0)
+        self.w13 = nn.Linear(dim, 2 * hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # SwiGLU implementation: (Swish(W1x) * W3x) * W2
-        return self.w2(nn.functional.silu(self.w1(x)) * self.w3(x))
+        x1, x3 = self.w13(x).chunk(2, dim=-1)
+        return self.w2(nn.functional.silu(x1) * x3)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """
+        Backwards-compatible loading from older checkpoints that had `w1` and `w3`.
+        """
+        w13_key = prefix + "w13.weight"
+        w1_key = prefix + "w1.weight"
+        w3_key = prefix + "w3.weight"
+
+        if w13_key not in state_dict and w1_key in state_dict and w3_key in state_dict:
+            # Build fused weight and remove legacy keys to avoid "unexpected key" warnings.
+            state_dict[w13_key] = torch.cat([state_dict[w1_key], state_dict[w3_key]], dim=0)
+            state_dict.pop(w1_key)
+            state_dict.pop(w3_key)
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
 class LlamaMIRASLayer(nn.Module):
     def __init__(self, dim: int, sequence_block: nn.Module, hidden_dim: int):

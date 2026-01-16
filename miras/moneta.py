@@ -31,9 +31,8 @@ class MonetaBlock(nn.Module):
         self.expansion_factor = expansion_factor
 
         # 1) Linear projections (Llama-style bias=False)
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
+        # Fuse Q/K/V projection into one GEMM (same math, fewer FLOPs / kernel launches).
+        self.qkv_proj = nn.Linear(dim, 3 * dim, bias=False)
 
         # 2) Depthwise convs (kernel=4) over sequence length
         self.q_conv = nn.Conv1d(dim, dim, kernel_size=4, padding=3, groups=dim)
@@ -50,6 +49,40 @@ class MonetaBlock(nn.Module):
         # 4) Output gating
         self.gate_proj = nn.Linear(dim, dim, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """
+        Backwards-compatible loading from older checkpoints that had `q_proj/k_proj/v_proj`.
+        """
+        qkv_key = prefix + "qkv_proj.weight"
+        q_key = prefix + "q_proj.weight"
+        k_key = prefix + "k_proj.weight"
+        v_key = prefix + "v_proj.weight"
+
+        if qkv_key not in state_dict and q_key in state_dict and k_key in state_dict and v_key in state_dict:
+            state_dict[qkv_key] = torch.cat([state_dict[q_key], state_dict[k_key], state_dict[v_key]], dim=0)
+            state_dict.pop(q_key)
+            state_dict.pop(k_key)
+            state_dict.pop(v_key)
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def apply_rope(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         """
@@ -69,9 +102,11 @@ class MonetaBlock(nn.Module):
         assert d == self.dim
 
         # Projections -> depthwise convs (slice back to length n)
-        q = self.q_conv(self.q_proj(x).transpose(1, 2))[:, :, :n].transpose(1, 2)
-        k = self.k_conv(self.k_proj(x).transpose(1, 2))[:, :, :n].transpose(1, 2)
-        v = self.v_conv(self.v_proj(x).transpose(1, 2))[:, :, :n].transpose(1, 2)
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = self.q_conv(q.transpose(1, 2))[:, :, :n].transpose(1, 2)
+        k = self.k_conv(k.transpose(1, 2))[:, :, :n].transpose(1, 2)
+        v = self.v_conv(v.transpose(1, 2))[:, :, :n].transpose(1, 2)
 
         # RoPE + L2 norm (as in your earlier sketch)
         q = F.normalize(self.apply_rope(q, freqs_cis), p=2, dim=-1)
@@ -87,7 +122,8 @@ class MonetaBlock(nn.Module):
         A = torch.zeros(b, d, d, device=x.device, dtype=x.dtype)
         W = self.W0.to(dtype=x.dtype, device=x.device).unsqueeze(0).expand(b, -1, -1)
 
-        outputs = []
+        # Pre-allocate outputs to avoid Python list growth + stack allocation.
+        y = x.new_empty((b, n, d))
         for t in range(n):
             kt, vt, qt = k[:, t], v[:, t], q[:, t]  # (b, d)
             etat, alphat = eta[:, t], alpha[:, t]  # (b,1,1)
@@ -97,7 +133,11 @@ class MonetaBlock(nn.Module):
             diff = pred - vt
 
             # Smooth Lp gradient wrt pred (elementwise), shape (b, d)
-            grad_pred = self.p * (torch.tanh(10 * diff) * torch.abs(diff).pow(self.p - 1))
+            # Fast path for default p=3: abs(diff)^(p-1) == diff^2 (same math, fewer ops).
+            if self.p == 3:
+                grad_pred = 3 * (torch.tanh(10 * diff) * (diff * diff))
+            else:
+                grad_pred = self.p * (torch.tanh(10 * diff) * torch.abs(diff).pow(self.p - 1))
 
             # Convert to gradient wrt W: outer(k_t, grad_pred) -> (b, d, d)
             grad_W = kt.unsqueeze(2) * grad_pred.unsqueeze(1)
@@ -106,14 +146,19 @@ class MonetaBlock(nn.Module):
             A = alphat * A - etat * grad_W
 
             # W_t = A_t / ||A_t||_q^{q-2}
-            norm_q = torch.linalg.vector_norm(A, ord=self.q, dim=(-2, -1), keepdim=True)
-            W = A / (norm_q.pow(self.q - 2) + self.eps)
+            # Fast path for default q=4:
+            #   ||A||_4^{(4-2)} == ||A||_4^2 == sqrt(sum_ij |A_ij|^4)
+            if self.q == 4:
+                a4 = A.square().square()
+                denom = torch.sqrt(a4.sum(dim=(-2, -1), keepdim=True)) + self.eps
+                W = A / denom
+            else:
+                norm_q = torch.linalg.vector_norm(A, ord=self.q, dim=(-2, -1), keepdim=True)
+                W = A / (norm_q.pow(self.q - 2) + self.eps)
 
             # Output y_t = q_t W_t  -> (b, d)
             yt = torch.bmm(qt.unsqueeze(1), W).squeeze(1)
-            outputs.append(yt)
-
-        y = torch.stack(outputs, dim=1)  # (b, n, d)
+            y[:, t] = yt
         return self.out_proj(y) * torch.sigmoid(self.gate_proj(x))
 
 
