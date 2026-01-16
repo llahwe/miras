@@ -131,6 +131,77 @@ Make sure `vast/entrypoint.sh` is executable:
 chmod +x vast/entrypoint.sh
 ```
 
+## Vast account setup: API key + SSH key (required for CLI + SSH)
+
+### 1) Install the Vast CLI (on your laptop)
+
+Recommended (via `uv`):
+
+```bash
+uv tool install vastai
+```
+
+Alternative (via `pip`):
+
+```bash
+python3 -m pip install --user vastai
+```
+
+Verify:
+
+```bash
+vastai --help
+```
+
+### 2) Set your Vast API key (for CLI commands)
+
+You need this to run `vastai search offers`, `vastai create instance`, etc.
+
+1. In the Vast web UI, go to your **Account / API Key** page and copy your key.
+2. On your laptop:
+
+```bash
+vastai set api-key <YOUR_VAST_API_KEY>
+```
+
+Sanity check:
+
+```bash
+vastai show user
+```
+
+### 3) Add an SSH public key to Vast (for SSH into instances)
+
+You need this if you want `--ssh` on instance creation and to login via SSH.
+
+1. On your laptop, create an SSH key if you don’t already have one:
+
+```bash
+ssh-keygen -t ed25519 -C "vast" -f ~/.ssh/vast_ed25519
+```
+
+2. Copy the public key:
+
+```bash
+cat ~/.ssh/vast_ed25519.pub
+```
+
+3. In the Vast web UI, go to **Account → SSH Keys** and add that public key.
+
+### 4) SSH into an instance
+
+When you create the instance with `--ssh`, Vast will show SSH connection info (host/port).
+Use the key you created:
+
+```bash
+ssh -i ~/.ssh/vast_ed25519 -p <PORT> root@<HOST>
+```
+
+### 5) Security notes
+
+- Never paste your Vast API key into repo docs.
+- Prefer a dedicated SSH key for Vast (like `~/.ssh/vast_ed25519`).
+
 ## Create a Vast instance (example CLI)
 
 This is a template; adjust ports and image to your setup. The critical pieces are:
