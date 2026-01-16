@@ -11,6 +11,7 @@ dependencies = [
     "tqdm",
     "datasets",
     "transformers",
+    "wandb",
 ]
 
 # This is the "magic" section that allows GPU support in a .toml
