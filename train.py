@@ -5,6 +5,9 @@ import dataclasses
 import datetime as dt
 import json
 import random
+import re
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -138,7 +141,27 @@ class TrainConfig:
     max_steps: int = 0  # 0 means "no step limit"
     max_time_seconds: int = 3600
     log_every_steps: int = 20
-    ckpt_every_seconds: int = 600
+    # Vast-friendly defaults:
+    ckpt_every_seconds: int = 300
+    ckpt_milestone_every_seconds: int = 3600
+    ckpt_keep_last: int = 12
+    ckpt_keep_milestones: int = 24
+    ckpt_prune: bool = True
+
+    # Logging
+    wandb: bool = False
+    wandb_project: str | None = None
+    wandb_entity: str | None = None
+    wandb_name: str | None = None
+    wandb_tags: str | None = None  # comma-separated
+    wandb_mode: str | None = None  # online|offline|disabled
+
+    # Sync (Google Drive via rclone)
+    gdrive_sync: bool = False
+    gdrive_remote: str = "gdrive"
+    # Remote base directory under Google Drive (rclone remote path).
+    # If you create nested folders like research/papers/miras in Drive, set this accordingly.
+    gdrive_dir: str = "research/papers/miras/runs"
 
     # Dry run
     dry_run: bool = False
@@ -280,6 +303,115 @@ def _checkpoint(
     return path
 
 
+def _try_get_git_metadata() -> dict[str, Any]:
+    try:
+        root = Path(__file__).resolve().parent
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root).decode().strip()
+        status = subprocess.check_output(["git", "status", "--porcelain"], cwd=root).decode()
+        dirty = bool(status.strip())
+        branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root).decode().strip()
+        return {"git_commit": commit, "git_dirty": dirty, "git_branch": branch}
+    except Exception:
+        return {}
+
+
+def _maybe_write_milestone_marker(*, ckpt_dir: Path, step: int, ckpt_path: Path) -> Path:
+    """
+    Write a small marker file identifying a checkpoint to keep as a "milestone".
+    This avoids duplicating multi-GB .pt files.
+    """
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    marker = ckpt_dir / f"milestone_step_{step:08d}.json"
+    payload = {
+        "step": int(step),
+        "checkpoint": ckpt_path.name,
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    marker.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return marker
+
+
+def _prune_checkpoints(*, ckpt_dir: Path, keep_last: int, keep_milestones: int) -> None:
+    """
+    Prune old step checkpoints while preserving:
+    - latest.pt
+    - last `keep_last` step_*.pt
+    - any step_*.pt referenced by the newest `keep_milestones` milestone markers
+    """
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    step_re = re.compile(r"^step_(\d{8})\.pt$")
+    steps: list[tuple[int, Path]] = []
+    for p in ckpt_dir.glob("step_*.pt"):
+        m = step_re.match(p.name)
+        if m:
+            steps.append((int(m.group(1)), p))
+    steps.sort(key=lambda t: t[0])
+
+    marker_re = re.compile(r"^milestone_step_(\d{8})\.json$")
+    markers: list[tuple[int, Path]] = []
+    for p in ckpt_dir.glob("milestone_step_*.json"):
+        m = marker_re.match(p.name)
+        if m:
+            markers.append((int(m.group(1)), p))
+    markers.sort(key=lambda t: t[0], reverse=True)
+
+    # Keep only newest N markers; delete older markers.
+    keep_marker_paths = {p for _s, p in markers[:keep_milestones]}
+    for _s, p in markers[keep_milestones:]:
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    preserve_steps: set[int] = set()
+    for s, _p in steps[-keep_last:]:
+        preserve_steps.add(s)
+
+    for p in keep_marker_paths:
+        try:
+            meta = json.loads(p.read_text(encoding="utf-8"))
+            preserve_steps.add(int(meta["step"]))
+        except Exception:
+            continue
+
+    for s, p in steps:
+        if s in preserve_steps:
+            continue
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _rclone_copyto(src: Path, dst: str) -> None:
+    if shutil.which("rclone") is None:
+        raise RuntimeError("rclone not found on PATH; install it or disable --gdrive-sync.")
+    subprocess.run(["rclone", "copyto", str(src), dst], check=True)
+
+
+def _maybe_gdrive_sync_run(*, cfg: TrainConfig, run_dir: Path, ckpt_path: Path | None) -> None:
+    if not cfg.gdrive_sync:
+        return
+    remote = cfg.gdrive_remote.rstrip(":")
+    base = cfg.gdrive_dir.strip("/").rstrip("/")
+    remote_run = f"{remote}:{base}/{run_dir.name}"
+
+    # Small metadata files.
+    config_path = run_dir / "config.json"
+    metrics_path = run_dir / "metrics.jsonl"
+    if config_path.exists():
+        _rclone_copyto(config_path, f"{remote_run}/config.json")
+    if metrics_path.exists():
+        _rclone_copyto(metrics_path, f"{remote_run}/metrics.jsonl")
+
+    if ckpt_path is not None and ckpt_path.exists():
+        _rclone_copyto(ckpt_path, f"{remote_run}/checkpoints/{ckpt_path.name}")
+        latest = ckpt_path.parent / "latest.pt"
+        if latest.exists():
+            _rclone_copyto(latest, f"{remote_run}/checkpoints/latest.pt")
+
+
 def _try_resume(
     resume_path: Path,
     *,
@@ -320,6 +452,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--precision", type=str, default="auto", choices=["auto", "fp32", "bf16", "fp16"])
     p.add_argument("--compile", action="store_true", help="Enable torch.compile (PyTorch 2.x).")
     p.add_argument("--no-tf32", action="store_true", help="Disable TF32 matmuls on CUDA.")
+    p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
+    p.add_argument("--wandb-project", type=str, default=None)
+    p.add_argument("--wandb-entity", type=str, default=None)
+    p.add_argument("--wandb-name", type=str, default=None)
+    p.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated tags.")
+    p.add_argument("--wandb-mode", type=str, default=None, help="online|offline|disabled")
 
     # Sequence/training
     p.add_argument("--seq-len", type=int, default=4096)
@@ -344,7 +482,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-steps", type=int, default=0, help="0 means no step limit.")
     p.add_argument("--max-time-seconds", type=int, default=3600)
     p.add_argument("--log-every-steps", type=int, default=20)
-    p.add_argument("--ckpt-every-seconds", type=int, default=600)
+    p.add_argument("--ckpt-every-seconds", type=int, default=300)
+    p.add_argument("--ckpt-milestone-every-seconds", type=int, default=3600)
+    p.add_argument("--ckpt-keep-last", type=int, default=12)
+    p.add_argument("--ckpt-keep-milestones", type=int, default=24)
+    p.add_argument("--no-ckpt-prune", action="store_true", help="Disable pruning old checkpoints.")
     p.add_argument("--resume", type=str, default=None, help="Path to a checkpoint .pt file.")
 
     # Data
@@ -354,6 +496,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-split", type=str, default="train")
     p.add_argument("--tokenizer-name", type=str, default="gpt2")
     p.add_argument("--buffer-tokens", type=int, default=2_000_000)
+
+    # Sync (Google Drive via rclone)
+    p.add_argument("--gdrive-sync", action="store_true", help="Sync checkpoints + metadata to Google Drive via rclone.")
+    p.add_argument("--gdrive-remote", type=str, default="gdrive", help="rclone remote name (default: gdrive).")
+    p.add_argument(
+        "--gdrive-dir",
+        type=str,
+        default="research/papers/miras/runs",
+        help="Remote base directory under the drive (default: research/papers/miras/runs).",
+    )
 
     # Dry-run knobs (offline)
     p.add_argument(
@@ -400,6 +552,19 @@ def main() -> None:
         max_time_seconds=int(args.max_time_seconds),
         log_every_steps=int(args.log_every_steps),
         ckpt_every_seconds=int(args.ckpt_every_seconds),
+        ckpt_milestone_every_seconds=int(args.ckpt_milestone_every_seconds),
+        ckpt_keep_last=int(args.ckpt_keep_last),
+        ckpt_keep_milestones=int(args.ckpt_keep_milestones),
+        ckpt_prune=not bool(args.no_ckpt_prune),
+        wandb=bool(args.wandb),
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_name=args.wandb_name,
+        wandb_tags=args.wandb_tags,
+        wandb_mode=args.wandb_mode,
+        gdrive_sync=bool(args.gdrive_sync),
+        gdrive_remote=args.gdrive_remote,
+        gdrive_dir=args.gdrive_dir,
         data_source=args.data_source,
         dataset_name=args.dataset_name,
         dataset_config=args.dataset_config,
@@ -489,6 +654,10 @@ def main() -> None:
             "vocab_size": vocab_size,
             "effective_microbatch_size": eff_mb,
             "effective_global_batch_size": eff_global_bs,
+            "torch_version": torch.__version__,
+            "cuda_available": bool(torch.cuda.is_available()),
+            "mps_available": bool(torch.backends.mps.is_available() and torch.backends.mps.is_built()),
+            **_try_get_git_metadata(),
         },
     )
 
@@ -507,6 +676,24 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
+    # Optional W&B init.
+    wandb_run = None
+    if cfg.wandb and not cfg.dry_run:
+        try:
+            import wandb  # type: ignore
+
+            tags = [t.strip() for t in (cfg.wandb_tags or "").split(",") if t.strip()] or None
+            wandb_run = wandb.init(
+                project=cfg.wandb_project,
+                entity=cfg.wandb_entity,
+                name=cfg.wandb_name or run_dir.name,
+                tags=tags,
+                mode=cfg.wandb_mode,
+                config=dataclasses.asdict(cfg),
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to init wandb (disable --wandb to proceed): {e}") from e
+
     start_step = 0
     if args.resume:
         start_step = _try_resume(Path(args.resume), device=device, model=model, optimizer=optimizer, scaler=scaler)
@@ -517,6 +704,7 @@ def main() -> None:
     model.train()
     t_start = time.time()
     t_last_ckpt = time.time()
+    t_last_milestone = time.time()
     t_last_log = time.time()
     tokens_since_log = 0
 
@@ -603,6 +791,11 @@ def main() -> None:
                 "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             }
             _append_jsonl(metrics_path, record)
+            if wandb_run is not None:
+                try:
+                    wandb_run.log(record, step=step)
+                except Exception:
+                    pass
             print(
                 f"[step {step}] loss={record['loss']:.4f} tok/s={record['tokens_per_s']:.0f} grad_norm={record['grad_norm']:.3f}"
             )
@@ -613,6 +806,21 @@ def main() -> None:
             path = _checkpoint(
                 ckpt_dir=ckpt_dir, model=model, optimizer=optimizer, scaler=(scaler if scaler.is_enabled() else None), step=step, cfg=cfg
             )
+            if (time.time() - t_last_milestone) >= cfg.ckpt_milestone_every_seconds:
+                _maybe_write_milestone_marker(ckpt_dir=ckpt_dir, step=step, ckpt_path=path)
+                t_last_milestone = time.time()
+
+            try:
+                _maybe_gdrive_sync_run(cfg=cfg, run_dir=run_dir, ckpt_path=path)
+            except Exception as e:
+                print(f"[warn] gdrive sync failed: {e}")
+
+            if cfg.ckpt_prune:
+                _prune_checkpoints(
+                    ckpt_dir=ckpt_dir,
+                    keep_last=int(cfg.ckpt_keep_last),
+                    keep_milestones=int(cfg.ckpt_keep_milestones),
+                )
             print(f"Saved checkpoint: {path}")
             t_last_ckpt = time.time()
 
@@ -621,9 +829,26 @@ def main() -> None:
         path = _checkpoint(
             ckpt_dir=ckpt_dir, model=model, optimizer=optimizer, scaler=(scaler if scaler.is_enabled() else None), step=step, cfg=cfg
         )
+        _maybe_write_milestone_marker(ckpt_dir=ckpt_dir, step=step, ckpt_path=path)
+        try:
+            _maybe_gdrive_sync_run(cfg=cfg, run_dir=run_dir, ckpt_path=path)
+        except Exception as e:
+            print(f"[warn] gdrive sync failed: {e}")
+        if cfg.ckpt_prune:
+            _prune_checkpoints(
+                ckpt_dir=ckpt_dir,
+                keep_last=int(cfg.ckpt_keep_last),
+                keep_milestones=int(cfg.ckpt_keep_milestones),
+            )
         print(f"Finished. Final checkpoint: {path}")
     else:
         print("Dry run finished successfully.")
+
+    if wandb_run is not None:
+        try:
+            wandb_run.finish()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
