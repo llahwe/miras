@@ -20,7 +20,10 @@ fi
 
 # Workspace assumptions for Vast:
 # - code lives in /workspace (typical Vast default)
-cd /workspace || true
+# Always run from the repo root (parent of this script) so tools like `uv`
+# can reliably find `pyproject.toml` regardless of the current working dir.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}/.." || true
 
 # If you provide a base64-encoded service account JSON, write it to disk.
 # IMPORTANT: do NOT echo this content.
