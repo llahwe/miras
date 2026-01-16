@@ -297,6 +297,9 @@ uv run python3 train.py \
 
 Notes:
 - `train.py` enables **layer activation checkpointing by default** (lower VRAM). To disable it (higher VRAM, slightly faster), pass `--no-grad-checkpoint`.
+- `train.py` also defaults to **truncated BPTT** for MONETA by detaching the recurrence state every 256 steps. To control it:
+  - lower VRAM: `--moneta-detach-state-every 128` (or 64)
+  - more exact gradients / higher VRAM: `--moneta-detach-state-every 0` (can OOM at `--seq-len 4096`)
 - If you still hit OOM, reduce sequence length (e.g. add `--seq-len 2048`).
 
 If you want more/less local history:

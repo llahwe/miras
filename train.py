@@ -113,6 +113,10 @@ class TrainConfig:
     n_heads: int = 16  # recorded for paper parity; not used by current model
     hidden_dim: int | None = None  # defaults to 4*dim in ModularLlama if None
 
+    # MONETA memory control
+    # Detach recurrence state every N steps (truncated BPTT). <=0 disables (can OOM for long seq_len).
+    moneta_detach_state_every: int = 256
+
     # Sequence
     seq_len: int = 4096
     max_seq_len: int = 4096  # RoPE precompute length; must be >= seq_len
@@ -484,6 +488,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--grad-clip-norm", type=float, default=1.0)
 
+    # MONETA memory control
+    p.add_argument(
+        "--moneta-detach-state-every",
+        type=int,
+        default=256,
+        help="Detach MONETA recurrence state every N steps (truncated BPTT). <=0 disables (higher VRAM).",
+    )
+
     # Runtime control
     p.add_argument("--max-steps", type=int, default=0, help="0 means no step limit.")
     p.add_argument("--max-time-seconds", type=int, default=3600)
@@ -539,6 +551,7 @@ def main() -> None:
         dim=dim,
         n_layers=n_layers,
         n_heads=n_heads,
+        moneta_detach_state_every=int(args.moneta_detach_state_every),
         run_name=args.run_name,
         runs_dir=args.runs_dir,
         seed=int(args.seed),
@@ -674,7 +687,7 @@ def main() -> None:
         dim=cfg.dim,
         max_seq_len=max(cfg.max_seq_len, cfg.seq_len),
         hidden_dim=cfg.hidden_dim,
-        block_factory=moneta_factory,
+        block_factory=lambda d: moneta_factory(d, detach_state_every=int(cfg.moneta_detach_state_every)),
         grad_checkpoint=bool(cfg.grad_checkpoint),
     ).to(device)
 

@@ -19,6 +19,7 @@ class MonetaBlock(nn.Module):
         q: int = 4,
         expansion_factor: int = 4,  # kept for future work; not used in recurrence
         eps: float = 1e-6,
+        detach_state_every: int = 256,
     ):
         super().__init__()
         if dim % 2 != 0:
@@ -29,6 +30,9 @@ class MonetaBlock(nn.Module):
         self.q = q
         self.eps = eps
         self.expansion_factor = expansion_factor
+        # Truncated BPTT: detach recurrence state every N steps to cap VRAM for long seq_len.
+        # Set <= 0 to disable (full BPTT; can OOM for seq_len=4096).
+        self.detach_state_every = int(detach_state_every)
 
         # 1) Linear projections (Llama-style bias=False)
         # Fuse Q/K/V projection into one GEMM (same math, fewer FLOPs / kernel launches).
@@ -159,6 +163,11 @@ class MonetaBlock(nn.Module):
             # Output y_t = q_t W_t  -> (b, d)
             yt = torch.bmm(qt.unsqueeze(1), W).squeeze(1)
             y[:, t] = yt
+
+            # Truncated BPTT: prevent the autograd graph from growing with n.
+            if self.detach_state_every > 0 and ((t + 1) % self.detach_state_every == 0) and (t + 1) < n:
+                A = A.detach()
+                W = W.detach()
         return self.out_proj(y) * torch.sigmoid(self.gate_proj(x))
 
 
