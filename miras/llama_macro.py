@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from typing import Callable, Optional
+from torch.utils.checkpoint import checkpoint
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -87,11 +88,13 @@ class ModularLlama(nn.Module):
         block_factory: Callable[[int], nn.Module],
         max_seq_len: int = 4096,
         hidden_dim: Optional[int] = None,
+        grad_checkpoint: bool = True,
     ):
         super().__init__()
         if dim % 2 != 0:
             raise ValueError(f"RoPE requires even dim, got dim={dim}")
 
+        self.grad_checkpoint = bool(grad_checkpoint)
         self.tok_embeddings = nn.Embedding(vocab_size, dim)
         
         # Precompute RoPE frequencies (freqs_cis)
@@ -122,6 +125,11 @@ class ModularLlama(nn.Module):
         freqs_cis = self.freqs_cis[:seq_len]
         
         for layer in self.layers:
-            h = layer(h, freqs_cis=freqs_cis)
+            if self.grad_checkpoint and self.training and torch.is_grad_enabled():
+                # Checkpoint each layer to avoid storing the full MONETA recurrence graph
+                # over long sequences (seq_len can be 4096).
+                h = checkpoint(lambda _h: layer(_h, freqs_cis=freqs_cis), h, use_reentrant=False)
+            else:
+                h = layer(h, freqs_cis=freqs_cis)
             
         return self.output(self.norm(h))

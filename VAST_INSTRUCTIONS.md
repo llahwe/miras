@@ -262,16 +262,42 @@ Defaults in `train.py` are Vast-friendly:
   - last **12** checkpoints (~1 hour at 5min)
   - last **24** milestones (~24 hours)
 
-Example run (S model):
+### Example: small model training run (recommended defaults)
+
+Basic run (small model, CUDA, **low-VRAM defaults**):
 
 ```bash
 uv run python3 train.py \
   --model-size s \
   --device cuda \
-  --precision auto \
+  --precision bf16
+```
+
+With W&B + Google Drive sync (personal Drive remote named `gdrive`) (**low-VRAM defaults**):
+
+```bash
+uv run python3 train.py \
+  --model-size s \
+  --device cuda \
+  --precision bf16 \
   --wandb --wandb-project "$WANDB_PROJECT" --wandb-entity "${WANDB_ENTITY:-}" \
   --gdrive-sync --gdrive-remote gdrive --gdrive-dir "research/papers/miras/runs"
 ```
+
+Example run (S model, explicit low-VRAM precision):
+
+```bash
+uv run python3 train.py \
+  --model-size s \
+  --device cuda \
+  --precision bf16 \
+  --wandb --wandb-project "$WANDB_PROJECT" --wandb-entity "${WANDB_ENTITY:-}" \
+  --gdrive-sync --gdrive-remote gdrive --gdrive-dir "research/papers/miras/runs"
+```
+
+Notes:
+- `train.py` enables **layer activation checkpointing by default** (lower VRAM). To disable it (higher VRAM, slightly faster), pass `--no-grad-checkpoint`.
+- If you still hit OOM, reduce sequence length (e.g. add `--seq-len 2048`).
 
 If you want more/less local history:
 - `--ckpt-keep-last 24` (2 hours at 5min)

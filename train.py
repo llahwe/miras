@@ -137,6 +137,7 @@ class TrainConfig:
     device: DeviceChoice = "auto"
     precision: PrecisionChoice = "auto"
     compile: bool = False
+    grad_checkpoint: bool = True
     tf32: bool = True  # CUDA only
     max_steps: int = 0  # 0 means "no step limit"
     max_time_seconds: int = 3600
@@ -451,6 +452,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--precision", type=str, default="auto", choices=["auto", "fp32", "bf16", "fp16"])
     p.add_argument("--compile", action="store_true", help="Enable torch.compile (PyTorch 2.x).")
+    p.add_argument(
+        "--no-grad-checkpoint",
+        action="store_true",
+        help="Disable activation checkpointing per layer (higher VRAM; slightly faster).",
+    )
     p.add_argument("--no-tf32", action="store_true", help="Disable TF32 matmuls on CUDA.")
     p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
     p.add_argument("--wandb-project", type=str, default=None)
@@ -539,6 +545,7 @@ def main() -> None:
         device=args.device,
         precision=args.precision,
         compile=bool(args.compile),
+        grad_checkpoint=not bool(args.no_grad_checkpoint),
         tf32=not bool(args.no_tf32),
         seq_len=int(args.seq_len),
         max_seq_len=int(args.max_seq_len),
@@ -668,6 +675,7 @@ def main() -> None:
         max_seq_len=max(cfg.max_seq_len, cfg.seq_len),
         hidden_dim=cfg.hidden_dim,
         block_factory=moneta_factory,
+        grad_checkpoint=bool(cfg.grad_checkpoint),
     ).to(device)
 
     if cfg.compile:
