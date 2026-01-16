@@ -202,7 +202,30 @@ ssh -i ~/.ssh/vast_ed25519 -p <PORT> root@<HOST>
 - Never paste your Vast API key into repo docs.
 - Prefer a dedicated SSH key for Vast (like `~/.ssh/vast_ed25519`).
 
-## Create a Vast instance (example CLI)
+## Create a Vast instance (Web UI from an existing template — recommended)
+
+If you already have a Vast **template** set up, the Web UI is the easiest way to launch new instances
+without dealing with long CLI commands.
+
+### Web UI steps (launch from template)
+
+1. In the Vast Web UI, go to **Templates** and select your existing template.
+2. Confirm the template settings:
+   - **Image**: your chosen PyTorch/CUDA image (or your custom image)
+   - **Disk**: **150–200 GB** (recommended)
+   - **On-start command**: `bash /workspace/vast/entrypoint.sh`
+   - **Environment variables**: set `WANDB_*` and (optionally) service-account `RCLONE_CONFIG_*`
+3. Click **Deploy** (or **Rent**) from that template, then pick an offer and launch.
+4. After it starts:
+   - Use the Web UI **Console/Terminal** or SSH in.
+   - If you’re using **personal Google Drive OAuth** (Option 1), run `rclone config` once on that instance.
+
+### Offer ID vs Instance ID (important)
+
+- **Offer ID**: identifies a listing you pick *before* launching. Used by CLI: `vastai create instance <OFFER_ID> ...`
+- **Instance ID**: identifies the running instance *after* you launch (what you start/stop/terminate).
+
+## Create a Vast instance (CLI)
 
 This is a template; adjust ports and image to your setup. The critical pieces are:
 - `--disk` size (recommend **150–200**)
