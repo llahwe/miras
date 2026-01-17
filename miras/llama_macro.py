@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
-from typing import Callable, Optional
+from dataclasses import dataclass
+from typing import Callable, Optional, Protocol, Tuple
 from torch.utils.checkpoint import checkpoint
+
+from .moneta import MonetaState
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -79,6 +82,30 @@ class LlamaMIRASLayer(nn.Module):
         out = h + self.mlp(self.ffn_norm(h))
         return out
 
+    def forward_step(
+        self,
+        x_t: torch.Tensor,  # (b, d)
+        *,
+        freqs_cis_t: torch.Tensor,  # (1, d/2) complex
+        state: MonetaState,
+    ) -> Tuple[torch.Tensor, MonetaState]:
+        """
+        Incremental (1-token) forward for fast generation.
+        """
+        # 1) Sequence modeling
+        seq_in = self.attention_norm(x_t)
+        seq_out, new_state = self.sequence_block.forward_step(seq_in, freqs_cis_t=freqs_cis_t, state=state)
+        h = x_t + seq_out
+        # 2) MLP
+        out = h + self.mlp(self.ffn_norm(h))
+        return out, new_state
+
+
+@dataclass
+class ModularLlamaState:
+    pos: int
+    layer_states: list[MonetaState]
+
 class ModularLlama(nn.Module):
     def __init__(
         self,
@@ -137,3 +164,42 @@ class ModularLlama(nn.Module):
                 h = layer(h, freqs_cis=freqs_cis)
             
         return self.output(self.norm(h))
+
+    def init_state(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        pos: int = 0,
+    ) -> ModularLlamaState:
+        layer_states: list[MonetaState] = []
+        for layer in self.layers:
+            # The sequence_block must expose init_state for fast generation.
+            layer_states.append(layer.sequence_block.init_state(batch_size=batch_size, device=device, dtype=dtype))
+        return ModularLlamaState(pos=int(pos), layer_states=layer_states)
+
+    def forward_step(
+        self,
+        token_t: torch.Tensor,  # (b,)
+        *,
+        state: ModularLlamaState,
+    ) -> Tuple[torch.Tensor, ModularLlamaState]:
+        """
+        Incremental (1-token) forward: returns logits for this token position.
+        """
+        if token_t.dim() != 1:
+            raise ValueError(f"token_t must have shape (b,), got {tuple(token_t.shape)}")
+
+        b = int(token_t.shape[0])
+        h = self.tok_embeddings(token_t)  # (b, d)
+        pos = int(state.pos)
+        freqs_cis_t = self.freqs_cis[pos : pos + 1]  # (1, d/2) complex
+
+        new_layer_states: list[MonetaState] = []
+        for layer, layer_state in zip(self.layers, state.layer_states):
+            h, new_s = layer.forward_step(h, freqs_cis_t=freqs_cis_t, state=layer_state)
+            new_layer_states.append(new_s)
+
+        logits = self.output(self.norm(h))  # (b, vocab)
+        return logits, ModularLlamaState(pos=pos + 1, layer_states=new_layer_states)

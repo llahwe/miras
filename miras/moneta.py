@@ -1,8 +1,25 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 from typing import Optional, Tuple
 from torch.utils.checkpoint import checkpoint
+
+
+@dataclass
+class MonetaState:
+    """
+    Cached state for fast incremental inference.
+
+    - A/W: recurrence state (b, d, d)
+    - *_hist: last 3 pre-conv inputs for depthwise conv (b, 3, d)
+    """
+
+    A: torch.Tensor
+    W: torch.Tensor
+    q_hist: torch.Tensor
+    k_hist: torch.Tensor
+    v_hist: torch.Tensor
 
 
 class MonetaBlock(nn.Module):
@@ -74,6 +91,22 @@ class MonetaBlock(nn.Module):
         self.gate_proj = nn.Linear(dim, dim, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
 
+    def init_state(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> MonetaState:
+        b = int(batch_size)
+        d = int(self.dim)
+        A = torch.zeros((b, d, d), device=device, dtype=dtype)
+        W = self.W0.to(device=device, dtype=dtype).unsqueeze(0).expand(b, -1, -1).contiguous()
+        # For kernel_size=4 with padding=3 and slicing back to length n,
+        # y_t depends on inputs x_{t-3..t}. Cache the last 3 tokens.
+        zeros_hist = torch.zeros((b, 3, d), device=device, dtype=dtype)
+        return MonetaState(A=A, W=W, q_hist=zeros_hist.clone(), k_hist=zeros_hist.clone(), v_hist=zeros_hist.clone())
+
     def _load_from_state_dict(
         self,
         state_dict,
@@ -120,6 +153,91 @@ class MonetaBlock(nn.Module):
         freqs_cis = freqs_cis.view(1, x.shape[1], -1)
         x_rotated = x_complex * freqs_cis
         return torch.view_as_real(x_rotated).flatten(2).type_as(x)
+
+    def _depthwise_conv_step(
+        self,
+        conv: nn.Conv1d,
+        *,
+        x_hist: torch.Tensor,  # (b, 3, d)
+        x_t: torch.Tensor,  # (b, d)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute the conv output at the current timestep, matching:
+          conv(x_seq.transpose(1,2))[:, :, :n].transpose(1,2)
+        for the last position.
+
+        With kernel_size=4, padding=3, output at position t uses inputs x_{t-3..t}
+        (no future tokens). We cache the last 3 inputs and append x_t.
+        """
+        # stacked: (b, 4, d) == [x_{t-3}, x_{t-2}, x_{t-1}, x_t]
+        stacked = torch.cat([x_hist, x_t.unsqueeze(1)], dim=1)
+        # weight: (d, 1, 4) -> (d, 4)
+        w = conv.weight.squeeze(1)
+        y_t = (stacked.permute(0, 2, 1) * w.unsqueeze(0)).sum(dim=-1)
+        if conv.bias is not None:
+            y_t = y_t + conv.bias.unsqueeze(0)
+        # new history keeps last 3 inputs
+        new_hist = stacked[:, 1:, :].contiguous()
+        return y_t, new_hist
+
+    def forward_step(
+        self,
+        x_t: torch.Tensor,  # (b, d)
+        *,
+        freqs_cis_t: torch.Tensor,  # (1, d/2) complex
+        state: MonetaState,
+    ) -> Tuple[torch.Tensor, MonetaState]:
+        """
+        Incremental (1-token) forward. Equivalent to running `forward` on the full
+        prefix and taking the last token output, but reuses cached recurrence/conv state.
+        """
+        b, d = x_t.shape
+        assert d == self.dim
+
+        qkv_t = self.qkv_proj(x_t)  # (b, 3d)
+        q_t, k_t, v_t = qkv_t.chunk(3, dim=-1)  # each (b, d)
+
+        q_t, q_hist = self._depthwise_conv_step(self.q_conv, x_hist=state.q_hist, x_t=q_t)
+        k_t, k_hist = self._depthwise_conv_step(self.k_conv, x_hist=state.k_hist, x_t=k_t)
+        v_t, v_hist = self._depthwise_conv_step(self.v_conv, x_hist=state.v_hist, x_t=v_t)
+
+        # RoPE + L2 norm
+        q1 = F.normalize(self.apply_rope(q_t.unsqueeze(1), freqs_cis_t), p=2, dim=-1).squeeze(1)  # (b, d)
+        k1 = F.normalize(self.apply_rope(k_t.unsqueeze(1), freqs_cis_t), p=2, dim=-1).squeeze(1)  # (b, d)
+
+        # eta/alpha for this token
+        params_t = self.param_gen(x_t)  # (b, 2)
+        eta_t, alpha_t = torch.chunk(params_t, 2, dim=-1)  # (b, 1) each
+        eta_t = torch.sigmoid(eta_t).view(b, 1, 1)  # (b,1,1)
+        alpha_t = torch.sigmoid(alpha_t).view(b, 1, 1)  # (b,1,1)
+
+        A = state.A
+        W = state.W
+
+        pred = torch.bmm(k1.unsqueeze(1), W).squeeze(1)  # (b, d)
+        diff = pred - v_t
+
+        if self.p == 3:
+            grad_pred = 3 * (torch.tanh(10 * diff) * (diff * diff))
+        else:
+            grad_pred = self.p * (torch.tanh(10 * diff) * torch.abs(diff).pow(self.p - 1))
+
+        grad_W = k1.unsqueeze(2) * grad_pred.unsqueeze(1)  # (b, d, d)
+        A = alpha_t * A - eta_t * grad_W
+
+        if self.q == 4:
+            a4 = A.square().square()
+            denom = torch.sqrt(a4.sum(dim=(-2, -1), keepdim=True)) + self.eps
+            W = A / denom
+        else:
+            norm_q = torch.linalg.vector_norm(A, ord=self.q, dim=(-2, -1), keepdim=True)
+            W = A / (norm_q.pow(self.q - 2) + self.eps)
+
+        y_t = torch.bmm(q1.unsqueeze(1), W).squeeze(1)  # (b, d)
+        out = self.out_proj(y_t) * torch.sigmoid(self.gate_proj(x_t))
+
+        new_state = MonetaState(A=A, W=W, q_hist=q_hist, k_hist=k_hist, v_hist=v_hist)
+        return out, new_state
 
     def _run_chunk(
         self,

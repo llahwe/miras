@@ -26,6 +26,28 @@ def seed_all(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+def _resolve_dtype(device: torch.device, dtype: str) -> torch.dtype:
+    if dtype == "fp32":
+        return torch.float32
+    if dtype == "bf16":
+        return torch.bfloat16
+    if dtype == "fp16":
+        return torch.float16
+    if dtype != "auto":
+        raise ValueError(f"Unknown dtype: {dtype}")
+
+    # auto
+    if device.type == "cuda":
+        try:
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+        except Exception:
+            pass
+        return torch.float16
+    if device.type == "mps":
+        return torch.float16
+    return torch.float32
+
 
 @torch.inference_mode()
 def generate(
@@ -38,11 +60,25 @@ def generate(
     temperature: float,
     top_k: int,
 ) -> str:
-    ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
+    if not isinstance(model, ModularLlama):
+        raise TypeError("This generator expects `ModularLlama` (for fast incremental decoding).")
+
+    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    if len(prompt_ids) == 0:
+        raise ValueError("Prompt tokenized to empty sequence.")
+
+    # Incremental decode: prefill state with the prompt, then sample one token at a time.
+    ids: list[int] = list(map(int, prompt_ids))
+    state = model.init_state(batch_size=1, device=device, dtype=next(model.parameters()).dtype, pos=0)
+
+    logits = None
+    for tid in ids:
+        logits, state = model.forward_step(torch.tensor([tid], device=device, dtype=torch.long), state=state)
+
+    assert logits is not None
 
     for _ in range(max_new_tokens):
-        logits = model(ids)  # (1, T, V)
-        next_logits = logits[0, -1]  # (V,)
+        next_logits = logits[0]  # (V,)
 
         if temperature <= 0:
             next_id = int(torch.argmax(next_logits).item())
@@ -56,12 +92,10 @@ def generate(
                 probs = torch.softmax(next_logits, dim=-1)
                 next_id = int(torch.multinomial(probs, 1).item())
 
-        ids = torch.cat(
-            [ids, torch.tensor([[next_id]], device=device, dtype=ids.dtype)],
-            dim=1,
-        )
+        ids.append(next_id)
+        logits, state = model.forward_step(torch.tensor([next_id], device=device, dtype=torch.long), state=state)
 
-    return tokenizer.decode(ids[0].tolist())
+    return tokenizer.decode(ids)
 
 
 def main() -> None:
@@ -82,11 +116,22 @@ def main() -> None:
     )
     ap.add_argument("--top-k", type=int, default=50, help="Top-k sampling; 0 disables.")
     ap.add_argument("--device", type=str, default="auto", help="auto|cpu|mps|cuda")
+    ap.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp32", "bf16", "fp16"])
+    ap.add_argument("--no-tf32", action="store_true", help="Disable TF32 matmuls on CUDA.")
     ap.add_argument("--seed", type=int, default=1337, help="Sampling seed.")
     args = ap.parse_args()
 
     device = pick_device(args.device)
     seed_all(int(args.seed))
+
+    if device.type == "cuda":
+        tf32 = not bool(args.no_tf32)
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+        torch.backends.cudnn.allow_tf32 = tf32
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     cfg = ckpt.get("config", {})
@@ -118,6 +163,10 @@ def main() -> None:
     ).to(device)
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
+    model.grad_checkpoint = False  # inference: no recompute
+
+    dtype = _resolve_dtype(device, str(args.dtype))
+    model = model.to(dtype=dtype)
 
     out = generate(
         model=model,
