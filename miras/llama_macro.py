@@ -126,8 +126,12 @@ class ModularLlama(nn.Module):
         
         for layer in self.layers:
             if self.grad_checkpoint and self.training and torch.is_grad_enabled():
-                # Checkpoint each layer to avoid storing the full MONETA recurrence graph
-                # over long sequences (seq_len can be 4096).
+                # Optional *outer* checkpointing across layers.
+                #
+                # Note: MIRAS/MONETA-style blocks may also checkpoint their inner-loop
+                # memory update per chunk. Keeping this layer-level checkpoint as a
+                # separate knob lets you trade extra recompute for lower activation
+                # memory across the full transformer stack.
                 h = checkpoint(lambda _h: layer(_h, freqs_cis=freqs_cis), h, use_reentrant=False)
             else:
                 h = layer(h, freqs_cis=freqs_cis)

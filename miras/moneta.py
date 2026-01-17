@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Tuple
+from torch.utils.checkpoint import checkpoint
 
 
 class MonetaBlock(nn.Module):
@@ -19,7 +20,14 @@ class MonetaBlock(nn.Module):
         q: int = 4,
         expansion_factor: int = 4,  # kept for future work; not used in recurrence
         eps: float = 1e-6,
+        # Backwards-compat: historically used for token-level detaching. In the refactor
+        # we interpret this as a *default chunk size* when `chunk_size` is not provided,
+        # matching typical configs where this was set to 256.
         detach_state_every: int = 256,
+        *,
+        chunk_size: Optional[int] = None,
+        tbptt_horizon_chunks: int = 4,
+        grad_checkpoint_inner: bool = True,
     ):
         super().__init__()
         if dim % 2 != 0:
@@ -30,9 +38,21 @@ class MonetaBlock(nn.Module):
         self.q = q
         self.eps = eps
         self.expansion_factor = expansion_factor
-        # Truncated BPTT: detach recurrence state every N steps to cap VRAM for long seq_len.
-        # Set <= 0 to disable (full BPTT; can OOM for seq_len=4096).
-        self.detach_state_every = int(detach_state_every)
+
+        # Chunking + TBPTT knobs:
+        # - Chunking is a forward-pass engineering trick: process the inner-loop update
+        #   in chunks (e.g. 256 tokens) and optionally checkpoint the chunk function.
+        # - TBPTT applies to the *outer loop*: detach the recurrence state every H chunks,
+        #   giving gradient horizon of H * chunk_size tokens while still carrying the
+        #   long-term memory state forward through the whole sequence.
+        if chunk_size is None:
+            chunk_size = int(detach_state_every)
+        self.chunk_size = int(chunk_size)
+        if self.chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0, got chunk_size={self.chunk_size}")
+
+        self.tbptt_horizon_chunks = int(tbptt_horizon_chunks)
+        self.grad_checkpoint_inner = bool(grad_checkpoint_inner)
 
         # 1) Linear projections (Llama-style bias=False)
         # Fuse Q/K/V projection into one GEMM (same math, fewer FLOPs / kernel launches).
@@ -101,36 +121,34 @@ class MonetaBlock(nn.Module):
         x_rotated = x_complex * freqs_cis
         return torch.view_as_real(x_rotated).flatten(2).type_as(x)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-        b, n, d = x.shape
-        assert d == self.dim
+    def _run_chunk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        eta: torch.Tensor,
+        alpha: torch.Tensor,
+        A: torch.Tensor,
+        W: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Run the MONETA inner-loop update over a chunk.
 
-        # Projections -> depthwise convs (slice back to length n)
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = self.q_conv(q.transpose(1, 2))[:, :, :n].transpose(1, 2)
-        k = self.k_conv(k.transpose(1, 2))[:, :, :n].transpose(1, 2)
-        v = self.v_conv(v.transpose(1, 2))[:, :, :n].transpose(1, 2)
+        Args:
+            q/k/v: (b, c, d)
+            eta/alpha: (b, c, 1, 1)
+            A/W: (b, d, d) recurrence state entering the chunk
 
-        # RoPE + L2 norm (as in your earlier sketch)
-        q = F.normalize(self.apply_rope(q, freqs_cis), p=2, dim=-1)
-        k = F.normalize(self.apply_rope(k, freqs_cis), p=2, dim=-1)
+        Returns:
+            y: (b, c, d) outputs for the chunk
+            A/W: recurrence state after processing the chunk
+        """
+        b, c, d = q.shape
+        y = q.new_empty((b, c, d))
 
-        # Data-dependent eta/alpha (scalar per token)
-        params = self.param_gen(x)  # (b, n, 2)
-        eta, alpha = torch.chunk(params, 2, dim=-1)
-        eta = torch.sigmoid(eta).view(b, n, 1, 1)
-        alpha = torch.sigmoid(alpha).view(b, n, 1, 1)
-
-        # Recurrence state: (b, dim, dim)
-        A = torch.zeros(b, d, d, device=x.device, dtype=x.dtype)
-        W = self.W0.to(dtype=x.dtype, device=x.device).unsqueeze(0).expand(b, -1, -1)
-
-        # Pre-allocate outputs to avoid Python list growth + stack allocation.
-        y = x.new_empty((b, n, d))
-        for t in range(n):
+        for t in range(c):
             kt, vt, qt = k[:, t], v[:, t], q[:, t]  # (b, d)
-            etat, alphat = eta[:, t], alpha[:, t]  # (b,1,1)
+            etat, alphat = eta[:, t], alpha[:, t]  # (b, 1, 1)
 
             # Predict v_t from k_t using current W: (b,d) @ (b,d,d) -> (b,d)
             pred = torch.bmm(kt.unsqueeze(1), W).squeeze(1)
@@ -161,11 +179,73 @@ class MonetaBlock(nn.Module):
                 W = A / (norm_q.pow(self.q - 2) + self.eps)
 
             # Output y_t = q_t W_t  -> (b, d)
-            yt = torch.bmm(qt.unsqueeze(1), W).squeeze(1)
-            y[:, t] = yt
+            y[:, t] = torch.bmm(qt.unsqueeze(1), W).squeeze(1)
 
-            # Truncated BPTT: prevent the autograd graph from growing with n.
-            if self.detach_state_every > 0 and ((t + 1) % self.detach_state_every == 0) and (t + 1) < n:
+        return y, A, W
+
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        b, n, d = x.shape
+        assert d == self.dim
+
+        # Projections -> depthwise convs (slice back to length n)
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = self.q_conv(q.transpose(1, 2))[:, :, :n].transpose(1, 2)
+        k = self.k_conv(k.transpose(1, 2))[:, :, :n].transpose(1, 2)
+        v = self.v_conv(v.transpose(1, 2))[:, :, :n].transpose(1, 2)
+
+        # RoPE + L2 norm (as in your earlier sketch)
+        q = F.normalize(self.apply_rope(q, freqs_cis), p=2, dim=-1)
+        k = F.normalize(self.apply_rope(k, freqs_cis), p=2, dim=-1)
+
+        # Data-dependent eta/alpha (scalar per token)
+        params = self.param_gen(x)  # (b, n, 2)
+        eta, alpha = torch.chunk(params, 2, dim=-1)
+        eta = torch.sigmoid(eta).view(b, n, 1, 1)
+        alpha = torch.sigmoid(alpha).view(b, n, 1, 1)
+
+        # Recurrence state: (b, dim, dim)
+        A = torch.zeros(b, d, d, device=x.device, dtype=x.dtype)
+        W = self.W0.to(dtype=x.dtype, device=x.device).unsqueeze(0).expand(b, -1, -1)
+
+        # Outputs for entire sequence
+        y = x.new_empty((b, n, d))
+
+        # Process inner-loop update in forward chunks.
+        # TBPTT applies at chunk boundaries (outer loop): detach state every H chunks.
+        chunk_size = min(self.chunk_size, n) if n > 0 else self.chunk_size
+        do_ckpt = self.grad_checkpoint_inner and self.training and torch.is_grad_enabled()
+
+        chunk_idx = 0
+        for start in range(0, n, chunk_size):
+            end = min(n, start + chunk_size)
+
+            q_c = q[:, start:end]
+            k_c = k[:, start:end]
+            v_c = v[:, start:end]
+            eta_c = eta[:, start:end]
+            alpha_c = alpha[:, start:end]
+
+            if do_ckpt:
+                y_c, A, W = checkpoint(
+                    lambda _q, _k, _v, _eta, _alpha, _A, _W: self._run_chunk(_q, _k, _v, _eta, _alpha, _A, _W),
+                    q_c,
+                    k_c,
+                    v_c,
+                    eta_c,
+                    alpha_c,
+                    A,
+                    W,
+                    use_reentrant=False,
+                )
+            else:
+                y_c, A, W = self._run_chunk(q_c, k_c, v_c, eta_c, alpha_c, A, W)
+
+            y[:, start:end] = y_c
+
+            chunk_idx += 1
+            if self.tbptt_horizon_chunks > 0 and (chunk_idx % self.tbptt_horizon_chunks == 0) and end < n:
+                # Truncated BPTT: cut gradient through the recurrence state every H chunks.
                 A = A.detach()
                 W = W.detach()
         return self.out_proj(y) * torch.sigmoid(self.gate_proj(x))
