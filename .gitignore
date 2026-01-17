@@ -208,3 +208,6 @@ runs/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+vast_setup.sh
